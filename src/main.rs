@@ -6,7 +6,7 @@ use protobuf::Message;
 use rand::RngCore;
 use tokio::{io::{Result, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 
-use crate::offline_wire_formats::{OfflineFrame, v1frame::FrameType};
+use crate::{offline_wire_formats::OfflineFrame, ukey::Ukey2ClientInit};
 
 fn b64(bytes: &[u8]) -> String {
     let str = general_purpose::STANDARD.encode(bytes);
@@ -58,20 +58,21 @@ async fn start_server(listener: TcpListener) {
     }
 }
 
+async fn read_msg_len(socket: &mut TcpStream) -> usize {
+    let mut msg_len = [0u8; 4];
+    let n = socket.read(&mut msg_len).await.unwrap();
+    assert!(n == 4);
+
+    let msg_len = u32::from_be_bytes(msg_len);
+    return msg_len as usize;
+}
+
 async fn process(mut socket: TcpStream) {
     loop {
-        let mut msg_len = [0u8; 4];
-        let n = socket.read(&mut msg_len).await.unwrap();
-        assert!(n == 4);
-
-        let msg_len = u32::from_be_bytes(msg_len);
-        println!("message length is {}", msg_len);
-
-        let mut buf = vec![0u8; msg_len as usize];
-        let n = socket.read(&mut buf).await.unwrap();
-        if n == 0 {
-            return;
-        }
+        // ConnectionRequestFrame
+        let msg_len = read_msg_len(&mut socket).await;
+        let mut buf = vec![0u8; msg_len];
+        socket.read(&mut buf).await.unwrap();
 
         let offline = OfflineFrame::parse_from_bytes(&buf).unwrap();
         println!("< {:?}", offline.v1.type_.unwrap());
@@ -92,7 +93,16 @@ async fn process(mut socket: TcpStream) {
         let device_name = std::str::from_utf8(&endpoint_info[18..18+device_name_size]).unwrap();
         println!("device_name: {}", device_name);
 
-        socket.write_all(&buf[0..n]).await.unwrap();
+        // UKEY2 Client Init
+        let msg_len = read_msg_len(&mut socket).await;
+        let mut buf = vec![0u8; msg_len];
+        socket.read(&mut buf).await.unwrap();
+
+        let ukey2_client_init = Ukey2ClientInit::parse_from_bytes(&buf).unwrap();
+        println!("ukey2_client_init: {:?}", ukey2_client_init);
+
+        todo!();
+        socket.write_all(&buf[0..1024]).await.unwrap();
     }
 }
 
