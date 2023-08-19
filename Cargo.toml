@@ -6,3 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+base64 = "0.21.2"
+libmdns = "0.7.5"
+mdns-sd = "0.7.4"
+rand = "0.8.5"
+tokio = { version = "1.32.0", features = ["full"] }
