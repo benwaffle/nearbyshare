@@ -3,12 +3,12 @@ include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use base64::{engine::general_purpose, Engine as _};
 use p256::{ecdh::EphemeralSecret, EncodedPoint, elliptic_curve::{generic_array::GenericArray, sec1::FromEncodedPoint}, PublicKey};
-use protobuf::{Message, SpecialFields};
+use protobuf::{Message, SpecialFields, MessageField};
 use rand::{RngCore, rngs::OsRng};
-use sha2::{Sha512, Digest};
+use sha2::{Sha512, Digest, Sha256};
 use tokio::{io::{Result, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 
-use crate::{offline_wire_formats::OfflineFrame, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey}};
+use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, V1Frame, v1frame::FrameType}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey}};
 
 fn b64(bytes: &[u8]) -> String {
     let str = general_purpose::STANDARD.encode(bytes);
@@ -100,6 +100,8 @@ async fn process(mut socket: TcpStream) -> ! {
         let mut buf = vec![0u8; msg_len];
         socket.read(&mut buf).await.unwrap();
 
+        let m1 = buf.clone();
+
         let ukey2_message = Ukey2Message::parse_from_bytes(&buf).unwrap();
         println!("uk2 msg: {:?}", ukey2_message);
 
@@ -144,6 +146,7 @@ async fn process(mut socket: TcpStream) -> ! {
         };
 
         let bytes = server_init.write_to_bytes().unwrap();
+        let m2 = bytes.clone();
         socket.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
         socket.write_all(&bytes).await.unwrap();
 
@@ -169,15 +172,55 @@ async fn process(mut socket: TcpStream) -> ! {
         let client_pub_key = GenericPublicKey::parse_from_bytes(&ukey2_client_finished.public_key.unwrap()).unwrap();
         assert_eq!(client_pub_key.type_, Some(PublicKeyType::EC_P256.into()));
 
+        let x = client_pub_key.ec_p256_public_key.x.as_ref().unwrap();
+        let y = client_pub_key.ec_p256_public_key.y.as_ref().unwrap();
+        // cut off leading 0x00 byte from incoming two's complement ints, as p256 uses unsigned ints
+        let x = &x[x.len()-32..];
+        let y = &y[y.len()-32..];
+
         // positive integers in two's complement are represented the same way as unsigned integers
         let client_pub_key_pt = EncodedPoint::from_affine_coordinates(
-            GenericArray::from_slice(client_pub_key.ec_p256_public_key.x.as_ref().unwrap().as_slice()),
-            GenericArray::from_slice(client_pub_key.ec_p256_public_key.y.as_ref().unwrap().as_slice()),
+            GenericArray::<u8, p256::U32>::from_slice(x),
+            GenericArray::<u8, p256::U32>::from_slice(y),
             false,
         );
         let client_pub_key_pt = PublicKey::from_encoded_point(&client_pub_key_pt).unwrap();
 
         let shared_secret = secret_key.diffie_hellman(&client_pub_key_pt);
+
+        // deriving keys
+        let m3 = [m1, m2].concat();
+
+        // auth string
+        let hkdf = shared_secret.extract::<Sha256>(Some(b"UKEY2 v1 auth"));
+        let mut auth = [0u8; 32];
+        hkdf.expand(&m3, &mut auth).unwrap();
+        dbg!(auth);
+
+        // next secret
+        let hkdf = shared_secret.extract::<Sha256>(Some(b"UKEY2 v1 next"));
+        let mut okm = [0u8; 32];
+        hkdf.expand(&m3, &mut okm).unwrap();
+        dbg!(okm);
+
+        // Connection Response
+        let mut connection_response = ConnectionResponseFrame::new();
+        connection_response.set_status(0);
+        connection_response.set_response(ResponseStatus::ACCEPT);
+        connection_response.os_info = MessageField::some(OsInfo { type_: Some(OsType::LINUX.into()), special_fields: SpecialFields::default() });
+
+        let mut v1frame = V1Frame::new();
+        v1frame.set_type(FrameType::CONNECTION_RESPONSE.into());
+        v1frame.connection_response = MessageField::some(connection_response);
+
+        let connection_response = OfflineFrame {
+            version: Some(offline_frame::Version::V1.into()),
+            v1: MessageField::some(v1frame),
+            special_fields: SpecialFields::default(),
+        };
+        let bytes = connection_response.write_to_bytes().unwrap();
+        socket.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+        socket.write_all(&bytes).await.unwrap();
 
         todo!();
     }
