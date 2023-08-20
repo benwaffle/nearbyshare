@@ -2,11 +2,12 @@ include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use base64::{engine::general_purpose, Engine as _};
-use protobuf::Message;
-use rand::RngCore;
+use p256::{ecdh::EphemeralSecret, EncodedPoint};
+use protobuf::{Message, SpecialFields};
+use rand::{RngCore, rngs::OsRng};
 use tokio::{io::{Result, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 
-use crate::{offline_wire_formats::OfflineFrame, ukey::Ukey2ClientInit};
+use crate::{offline_wire_formats::OfflineFrame, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey}};
 
 fn b64(bytes: &[u8]) -> String {
     let str = general_purpose::STANDARD.encode(bytes);
@@ -61,13 +62,13 @@ async fn start_server(listener: TcpListener) {
 async fn read_msg_len(socket: &mut TcpStream) -> usize {
     let mut msg_len = [0u8; 4];
     let n = socket.read(&mut msg_len).await.unwrap();
-    assert!(n == 4);
+    assert_eq!(n, 4);
 
     let msg_len = u32::from_be_bytes(msg_len);
     return msg_len as usize;
 }
 
-async fn process(mut socket: TcpStream) {
+async fn process(mut socket: TcpStream) -> ! {
     loop {
         // ConnectionRequestFrame
         let msg_len = read_msg_len(&mut socket).await;
@@ -98,11 +99,65 @@ async fn process(mut socket: TcpStream) {
         let mut buf = vec![0u8; msg_len];
         socket.read(&mut buf).await.unwrap();
 
-        let ukey2_client_init = Ukey2ClientInit::parse_from_bytes(&buf).unwrap();
+        let ukey2_message = Ukey2Message::parse_from_bytes(&buf).unwrap();
+        println!("uk2 msg: {:?}", ukey2_message);
+
+        let ukey2_client_init = Ukey2ClientInit::parse_from_bytes(ukey2_message.message_data()).unwrap();
         println!("ukey2_client_init: {:?}", ukey2_client_init);
 
+        let has_p256 = ukey2_client_init.cipher_commitments.iter().any(|c| c.handshake_cipher() == Ukey2HandshakeCipher::P256_SHA512);
+        assert!(has_p256);
+
+        let secret_key = EphemeralSecret::random(&mut OsRng);
+        let encoded = EncodedPoint::from(secret_key.public_key());
+
+        let mut public_key_pb = GenericPublicKey::new();
+        public_key_pb.set_type(PublicKeyType::EC_P256.into());
+
+        let x = encoded.x().unwrap().to_vec();
+        let y = encoded.y().unwrap().to_vec();
+
+        // securemessage.proto requires two's complement. p256 gives unsigned encodings, so just prepend a 0.
+        let x = [vec![0u8], x].concat();
+        let y = [vec![0u8], y].concat();
+
+        public_key_pb.ec_p256_public_key = Some(EcP256PublicKey {
+            x: Some(x),
+            y: Some(y),
+            special_fields: SpecialFields::default(),
+        }).into();
+
+        let mut random = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut random);
+
+        let server_init = Ukey2ServerInit {
+            version: Some(1),
+            random: Some(random.into()),
+            handshake_cipher: Some(Ukey2HandshakeCipher::P256_SHA512.into()),
+            public_key: Some(public_key_pb.write_to_bytes().unwrap()),
+            special_fields: SpecialFields::default(),
+        };
+        let server_init = Ukey2Message {
+            message_type: Some(ukey2message::Type::SERVER_INIT.into()),
+            message_data: Some(server_init.write_to_bytes().unwrap()),
+            special_fields: SpecialFields::default(),
+        };
+
+        let bytes = server_init.write_to_bytes().unwrap();
+        socket.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+        socket.write_all(&bytes).await.unwrap();
+
+        // UKEY2 Client Finish
+        let msg_len = read_msg_len(&mut socket).await;
+        let mut buf = vec![0u8; msg_len];
+        socket.read(&mut buf).await.unwrap();
+
+        let ukey2_message = Ukey2Message::parse_from_bytes(&buf).unwrap();
+        println!("uk2 msg: {:?}", ukey2_message);
+        println!("uk2 alert: {:?}", Ukey2Alert::parse_from_bytes(&buf).unwrap());
+        assert_eq!(ukey2_message.message_type, Some(ukey2message::Type::CLIENT_FINISH.into()));
+
         todo!();
-        socket.write_all(&buf[0..1024]).await.unwrap();
     }
 }
 
