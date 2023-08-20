@@ -2,12 +2,13 @@ include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use base64::{engine::general_purpose, Engine as _};
-use p256::{ecdh::EphemeralSecret, EncodedPoint};
+use p256::{ecdh::EphemeralSecret, EncodedPoint, elliptic_curve::{generic_array::GenericArray, sec1::FromEncodedPoint}, PublicKey};
 use protobuf::{Message, SpecialFields};
 use rand::{RngCore, rngs::OsRng};
+use sha2::{Sha512, Digest};
 use tokio::{io::{Result, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 
-use crate::{offline_wire_formats::OfflineFrame, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey}};
+use crate::{offline_wire_formats::OfflineFrame, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey}};
 
 fn b64(bytes: &[u8]) -> String {
     let str = general_purpose::STANDARD.encode(bytes);
@@ -105,8 +106,7 @@ async fn process(mut socket: TcpStream) -> ! {
         let ukey2_client_init = Ukey2ClientInit::parse_from_bytes(ukey2_message.message_data()).unwrap();
         println!("ukey2_client_init: {:?}", ukey2_client_init);
 
-        let has_p256 = ukey2_client_init.cipher_commitments.iter().any(|c| c.handshake_cipher() == Ukey2HandshakeCipher::P256_SHA512);
-        assert!(has_p256);
+        let cipher = ukey2_client_init.cipher_commitments.iter().find(|c| c.handshake_cipher() == Ukey2HandshakeCipher::P256_SHA512).unwrap();
 
         let secret_key = EphemeralSecret::random(&mut OsRng);
         let encoded = EncodedPoint::from(secret_key.public_key());
@@ -147,15 +147,37 @@ async fn process(mut socket: TcpStream) -> ! {
         socket.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
         socket.write_all(&bytes).await.unwrap();
 
-        // UKEY2 Client Finish
+        // UKEY2 Client Finished
         let msg_len = read_msg_len(&mut socket).await;
         let mut buf = vec![0u8; msg_len];
         socket.read(&mut buf).await.unwrap();
 
+        println!("uk2 alert: {:?}", Ukey2Alert::parse_from_bytes(&buf));
+
         let ukey2_message = Ukey2Message::parse_from_bytes(&buf).unwrap();
         println!("uk2 msg: {:?}", ukey2_message);
-        println!("uk2 alert: {:?}", Ukey2Alert::parse_from_bytes(&buf).unwrap());
         assert_eq!(ukey2_message.message_type, Some(ukey2message::Type::CLIENT_FINISH.into()));
+
+        // verify commitment hash
+        let mut hasher = Sha512::new();
+        hasher.update(buf);
+        let commitment_hash = hasher.finalize();
+        assert_eq!(commitment_hash.as_slice(), cipher.commitment());
+
+        let ukey2_client_finished = Ukey2ClientFinished::parse_from_bytes(ukey2_message.message_data()).unwrap();
+
+        let client_pub_key = GenericPublicKey::parse_from_bytes(&ukey2_client_finished.public_key.unwrap()).unwrap();
+        assert_eq!(client_pub_key.type_, Some(PublicKeyType::EC_P256.into()));
+
+        // positive integers in two's complement are represented the same way as unsigned integers
+        let client_pub_key_pt = EncodedPoint::from_affine_coordinates(
+            GenericArray::from_slice(client_pub_key.ec_p256_public_key.x.as_ref().unwrap().as_slice()),
+            GenericArray::from_slice(client_pub_key.ec_p256_public_key.y.as_ref().unwrap().as_slice()),
+            false,
+        );
+        let client_pub_key_pt = PublicKey::from_encoded_point(&client_pub_key_pt).unwrap();
+
+        let shared_secret = secret_key.diffie_hellman(&client_pub_key_pt);
 
         todo!();
     }
