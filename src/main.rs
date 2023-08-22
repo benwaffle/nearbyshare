@@ -1,5 +1,6 @@
 include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 
+use hkdf::Hkdf;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use base64::{engine::general_purpose, Engine as _};
 use p256::{ecdh::EphemeralSecret, EncodedPoint, elliptic_curve::{generic_array::GenericArray, sec1::FromEncodedPoint}, PublicKey};
@@ -69,6 +70,13 @@ async fn read_msg_len(socket: &mut TcpStream) -> usize {
     return msg_len as usize;
 }
 
+fn do_hkdf(salt: &[u8], input_key: &[u8], info: &[u8], size: usize) -> Vec<u8> {
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), input_key);
+    let mut okm = vec![0u8; size];
+    hkdf.expand(info, &mut okm).unwrap();
+    return okm;
+}
+
 async fn process(mut socket: TcpStream) -> ! {
     loop {
         // ConnectionRequestFrame
@@ -107,6 +115,8 @@ async fn process(mut socket: TcpStream) -> ! {
 
         let ukey2_client_init = Ukey2ClientInit::parse_from_bytes(ukey2_message.message_data()).unwrap();
         println!("ukey2_client_init: {:?}", ukey2_client_init);
+
+        assert!(ukey2_client_init.next_protocol.unwrap() == "AES_256_CBC-HMAC_SHA256");
 
         let cipher = ukey2_client_init.cipher_commitments.iter().find(|c| c.handshake_cipher() == Ukey2HandshakeCipher::P256_SHA512).unwrap();
 
@@ -184,24 +194,39 @@ async fn process(mut socket: TcpStream) -> ! {
             GenericArray::<u8, p256::U32>::from_slice(y),
             false,
         );
-        let client_pub_key_pt = PublicKey::from_encoded_point(&client_pub_key_pt).unwrap();
+        let client_pub_key = PublicKey::from_encoded_point(&client_pub_key_pt).unwrap();
 
-        let shared_secret = secret_key.diffie_hellman(&client_pub_key_pt);
+        let shared_secret = secret_key.diffie_hellman(&client_pub_key);
 
         // deriving keys
         let m3 = [m1, m2].concat();
 
-        // auth string
-        let hkdf = shared_secret.extract::<Sha256>(Some(b"UKEY2 v1 auth"));
-        let mut auth = [0u8; 32];
-        hkdf.expand(&m3, &mut auth).unwrap();
-        dbg!(auth);
+        let authentication_string = do_hkdf(b"UKEY2 v1 auth", shared_secret.raw_secret_bytes(), &m3, 32);
+        let next_protocol_secret = do_hkdf(b"UKEY2 v1 next", shared_secret.raw_secret_bytes(), &m3, 32);
 
-        // next secret
-        let hkdf = shared_secret.extract::<Sha256>(Some(b"UKEY2 v1 next"));
-        let mut okm = [0u8; 32];
-        hkdf.expand(&m3, &mut okm).unwrap();
-        dbg!(okm);
+        // device-to-device client key
+        let d2d_salt = hex::decode("82AA55A0D397F88346CA1CEE8D3909B95F13FA7DEB1D4AB38376B8256DA85510").unwrap();
+        let d2d_client_key = do_hkdf(&d2d_salt, &next_protocol_secret, b"client", 32);
+        let d2d_server_key = do_hkdf(&d2d_salt, &next_protocol_secret, b"server", 32);
+
+        // this is sha256("SecureMessage")
+        let salt = hex::decode("BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E").unwrap();
+        let decrypt_key = do_hkdf(&salt, &d2d_client_key, b"ENC:2", 32);
+        let receive_hmac_key = do_hkdf(&salt, &d2d_client_key, b"SIG:1", 32);
+        let encrypt_key = do_hkdf(&salt, &d2d_server_key, b"ENC:2", 32);
+        let send_hmac_key = do_hkdf(&salt, &d2d_server_key, b"SIG:1", 32);
+
+        fn generate_pin_code(auth_string: &[u8]) -> String {
+            let mut hash: i32 = 0;
+            let mut multiplier: i32 = 1;
+            for byte in auth_string {
+                hash = (hash + (*byte as i8 as i32) * multiplier) % 9973;
+                multiplier = (multiplier * 31) % 9973;
+            }
+            return format!("{:04}", hash.abs());
+        }
+
+        dbg!(generate_pin_code(&authentication_string));
 
         // Connection Response
         let mut connection_response = ConnectionResponseFrame::new();
