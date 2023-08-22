@@ -1,5 +1,6 @@
 include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 
+use aes::cipher::{KeyIvInit, BlockDecryptMut, block_padding::Pkcs7};
 use hkdf::Hkdf;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use base64::{engine::general_purpose, Engine as _};
@@ -8,8 +9,9 @@ use protobuf::{Message, SpecialFields, MessageField};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Sha512, Digest, Sha256};
 use tokio::{io::{Result, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+use hmac::{Mac};
 
-use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, V1Frame, v1frame::FrameType}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey}};
+use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, V1Frame, v1frame::FrameType}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey, SecureMessage, HeaderAndBody, SigScheme}, securegcm::GcmMetadata, device_to_device_messages::DeviceToDeviceMessage};
 
 fn b64(bytes: &[u8]) -> String {
     let str = general_purpose::STANDARD.encode(bytes);
@@ -246,6 +248,45 @@ async fn process(mut socket: TcpStream) -> ! {
         let bytes = connection_response.write_to_bytes().unwrap();
         socket.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
         socket.write_all(&bytes).await.unwrap();
+
+        // key exchange complete
+
+        // connection response from android?
+        let msg_len = read_msg_len(&mut socket).await;
+        let mut buf = vec![0u8; msg_len];
+        socket.read(&mut buf).await.unwrap();
+
+        let offline_frame = OfflineFrame::parse_from_bytes(&buf).unwrap();
+        dbg!(offline_frame);
+
+        // paired key encryption
+        let msg_len = read_msg_len(&mut socket).await;
+        let mut buf = vec![0u8; msg_len];
+        socket.read(&mut buf).await.unwrap();
+        // write buf to msg.buf
+        std::fs::write("enc.buf", &buf).unwrap();
+
+        let secure_message = SecureMessage::parse_from_bytes(&buf).unwrap();
+        let header_and_body = HeaderAndBody::parse_from_bytes(secure_message.header_and_body()).unwrap();
+        let gcm_metadata = GcmMetadata::parse_from_bytes(header_and_body.header.public_metadata()).unwrap();
+        dbg!(&header_and_body, &gcm_metadata);
+        assert_eq!(header_and_body.header.signature_scheme(), SigScheme::HMAC_SHA256);
+        assert_eq!(gcm_metadata.type_(), securegcm::Type::DEVICE_TO_DEVICE_MESSAGE);
+
+        let mut sig = hmac::Hmac::<Sha256>::new_from_slice(&receive_hmac_key).unwrap();
+        sig.update(secure_message.header_and_body());
+        dbg!(sig.finalize().into_bytes(), secure_message.signature());
+
+        let decryptor = cbc::Decryptor::<aes::Aes256>::new(decrypt_key.as_slice().into(), header_and_body.header.iv().into());
+        let mut buf = vec![0u8; header_and_body.body().len()];
+        decryptor.decrypt_padded_mut::<Pkcs7>(&mut buf).unwrap();
+        dbg!(&buf);
+        std::fs::write("dec.buf", &buf).unwrap();
+
+        let d2dmsg = DeviceToDeviceMessage::parse_from_bytes(&buf).unwrap();
+        dbg!(d2dmsg);
+
+        std::thread::sleep(std::time::Duration::from_secs(3));
 
         todo!();
     }
