@@ -1,17 +1,20 @@
 include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 
-use aes::cipher::{KeyIvInit, BlockDecryptMut, block_padding::Pkcs7};
+use aes::cipher::{BlockDecryptMut, block_padding::Pkcs7, KeyIvInit, BlockEncryptMut};
 use hkdf::Hkdf;
+use hmac::Mac;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use base64::{engine::general_purpose, Engine as _};
 use p256::{ecdh::EphemeralSecret, EncodedPoint, elliptic_curve::{generic_array::GenericArray, sec1::FromEncodedPoint}, PublicKey};
-use protobuf::{Message, SpecialFields, MessageField};
+use protobuf::{Message, SpecialFields, MessageField, Enum};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Sha512, Digest, Sha256};
 use tokio::{io::{Result, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
-use hmac::{Mac};
 
-use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, V1Frame, v1frame::FrameType, payload_transfer_frame::{PacketType, payload_header::PayloadType}}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey, SecureMessage, HeaderAndBody, SigScheme}, securegcm::GcmMetadata, device_to_device_messages::DeviceToDeviceMessage, wire_format::Frame};
+use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, v1frame::FrameType, payload_transfer_frame::{PacketType, payload_header::PayloadType, PayloadHeader, PayloadChunk, payload_chunk::Flags}, PayloadTransferFrame}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey, SecureMessage, HeaderAndBody, SigScheme, Header, EncScheme}, securegcm::GcmMetadata, device_to_device_messages::DeviceToDeviceMessage, wire_format::{Frame, frame, PairedKeyEncryptionFrame}};
+
+type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
 fn b64(bytes: &[u8]) -> String {
     let str = general_purpose::STANDARD.encode(bytes);
@@ -83,6 +86,81 @@ fn do_hkdf(salt: &[u8], input_key: &[u8], info: &[u8], size: usize) -> Vec<u8> {
     let mut okm = vec![0u8; size];
     hkdf.expand(info, &mut okm).unwrap();
     okm
+}
+
+fn sign_and_encrypt_d2d(encrypt_key: &[u8], send_hmac_key: &[u8], d2dmsg: &DeviceToDeviceMessage) -> SecureMessage {
+    let mut iv = vec![0u8; 16];
+    rand::thread_rng().fill_bytes(&mut iv);
+
+    let encryptor = Aes256CbcEnc::new_from_slices(&encrypt_key, &iv).unwrap();
+    let encrypted = encryptor.encrypt_padded_vec_mut::<Pkcs7>(&d2dmsg.write_to_bytes().unwrap());
+
+    let mut gcm_metadata = GcmMetadata::new();
+    gcm_metadata.set_type(securegcm::Type::DEVICE_TO_DEVICE_MESSAGE);
+    gcm_metadata.set_version(1);
+
+    let mut header = Header::new();
+    header.set_signature_scheme(SigScheme::HMAC_SHA256);
+    header.set_encryption_scheme(EncScheme::AES_256_CBC);
+    header.set_iv(iv);
+    header.set_public_metadata(gcm_metadata.write_to_bytes().unwrap());
+
+    let mut header_and_body = HeaderAndBody::new();
+    header_and_body.header = Some(header).into();
+    header_and_body.body = Some(encrypted);
+
+    let header_and_body_bytes = header_and_body.write_to_bytes().unwrap();
+    let mut hmac = hmac::Hmac::<Sha256>::new_from_slice(&send_hmac_key).unwrap();
+    hmac.update(&header_and_body_bytes);
+
+    let mut securemessage = SecureMessage::new();
+    securemessage.header_and_body = Some(header_and_body.write_to_bytes().unwrap()).into();
+    securemessage.signature = Some(hmac.finalize().into_bytes().to_vec()).into();
+
+    securemessage
+}
+
+fn encode_payload_chunks(id: i64, data: &[u8]) -> Vec<OfflineFrame> {
+    const MAX_CHUNK_SIZE: usize = 8 * 1024 * 1024; // TODO: pick a good value
+    let mut res = vec![];
+
+    fn new_frame(id: i64, offset: usize, chunk: &[u8], total_size: usize, last: bool) -> OfflineFrame {
+        let mut payload_header = PayloadHeader::new();
+        payload_header.set_id(id);
+        payload_header.set_type(PayloadType::BYTES);
+        payload_header.set_total_size(total_size as i64);
+
+        let mut payload_chunk = PayloadChunk::new();
+        payload_chunk.set_offset(offset as i64);
+        payload_chunk.set_flags(if last { Flags::LAST_CHUNK.value() } else { 0 });
+        payload_chunk.body = Some(chunk.to_vec()).into();
+
+        let mut payload_transfer_frame = PayloadTransferFrame::new();
+        payload_transfer_frame.set_packet_type(PacketType::DATA);
+        payload_transfer_frame.payload_header = Some(payload_header).into();
+        payload_transfer_frame.payload_chunk = Some(payload_chunk).into();
+
+        let mut v1frame = offline_wire_formats::V1Frame::new();
+        v1frame.set_type(offline_wire_formats::v1frame::FrameType::PAYLOAD_TRANSFER);
+        v1frame.payload_transfer = Some(payload_transfer_frame).into();
+
+        let mut frame = OfflineFrame::new();
+        frame.set_version(offline_frame::Version::V1);
+        frame.v1 = Some(offline_wire_formats::V1Frame::new()).into();
+
+        frame
+    }
+
+    for (i, chunk) in data.chunks(MAX_CHUNK_SIZE).enumerate() {
+        let offset = i * MAX_CHUNK_SIZE;
+        let total_size = data.len();
+        res.push(new_frame(id, offset, chunk, total_size, false));
+    }
+
+    // last empty chunk with LAST_CHUNK flag set
+    res.push(new_frame(id, data.len(), &[], data.len(), true));
+
+    res
 }
 
 impl From<PublicKey> for securemessage::GenericPublicKey {
@@ -230,8 +308,8 @@ async fn process(mut socket: TcpStream) -> ! {
     let salt = hex::decode("BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E").unwrap();
     let decrypt_key = do_hkdf(&salt, &d2d_client_key, b"ENC:2", 32);
     let receive_hmac_key = do_hkdf(&salt, &d2d_client_key, b"SIG:1", 32);
-    let _encrypt_key = do_hkdf(&salt, &d2d_server_key, b"ENC:2", 32);
-    let _send_hmac_key = do_hkdf(&salt, &d2d_server_key, b"SIG:1", 32);
+    let encrypt_key = do_hkdf(&salt, &d2d_server_key, b"ENC:2", 32);
+    let send_hmac_key = do_hkdf(&salt, &d2d_server_key, b"SIG:1", 32);
 
     fn generate_pin_code(auth_string: &[u8]) -> String {
         let mut hash: i32 = 0;
@@ -251,7 +329,7 @@ async fn process(mut socket: TcpStream) -> ! {
     connection_response.set_response(ResponseStatus::ACCEPT);
     connection_response.os_info = MessageField::some(OsInfo { type_: Some(OsType::LINUX.into()), special_fields: SpecialFields::default() });
 
-    let mut v1frame = V1Frame::new();
+    let mut v1frame = offline_wire_formats::V1Frame::new();
     v1frame.set_type(FrameType::CONNECTION_RESPONSE.into());
     v1frame.connection_response = MessageField::some(connection_response);
 
@@ -283,7 +361,7 @@ async fn process(mut socket: TcpStream) -> ! {
     sig.update(secure_message.header_and_body());
     sig.verify_slice(secure_message.signature()).unwrap();
 
-    let decryptor = cbc::Decryptor::<aes::Aes256>::new(decrypt_key.as_slice().into(), header_and_body.header.iv().into());
+    let decryptor = Aes256CbcDec::new_from_slices(&decrypt_key, header_and_body.header.iv()).unwrap();
     let mut buf = vec![0u8; header_and_body.body().len()];
     let res = decryptor.decrypt_padded_b2b_mut::<Pkcs7>(header_and_body.body(), &mut buf).unwrap();
 
@@ -298,6 +376,43 @@ async fn process(mut socket: TcpStream) -> ! {
     let buf = offline_frame.v1.payload_transfer.payload_chunk.body();
     let frame = Frame::parse_from_bytes(buf).unwrap();
     dbg!(frame);
+
+    // TODO: read multiple chunks
+
+    // send paired key encryption
+    let mut signed_data = vec![0u8; 72];
+    rand::thread_rng().fill_bytes(&mut signed_data);
+
+    let mut secret_id_hash = vec![0u8; 6];
+    rand::thread_rng().fill_bytes(&mut secret_id_hash);
+
+    let mut paired_key_encryption = PairedKeyEncryptionFrame::new();
+    paired_key_encryption.signed_data = Some(signed_data);
+    paired_key_encryption.secret_id_hash = Some(secret_id_hash);
+
+    let mut v1frame = wire_format::V1Frame::new();
+    v1frame.set_type(wire_format::v1frame::FrameType::PAIRED_KEY_ENCRYPTION);
+    v1frame.paired_key_encryption = Some(paired_key_encryption).into();
+
+    let mut frame = wire_format::Frame::new();
+    frame.set_version(frame::Version::V1);
+    frame.v1 = Some(v1frame).into();
+
+    // payload layer
+    let data = frame.write_to_bytes().unwrap();
+
+    let id = 12345;
+    let frames = encode_payload_chunks(id, &data);
+
+    for (i, frame) in frames.iter().enumerate() {
+        // encryption layer
+        let mut d2dmsg = DeviceToDeviceMessage::new();
+        d2dmsg.set_sequence_number((i + 1) as i32);
+        d2dmsg.set_message(frame.write_to_bytes().unwrap());
+
+        let securemessage = sign_and_encrypt_d2d(&encrypt_key, &send_hmac_key, &d2dmsg);
+        write_msg(&mut socket, &securemessage).await;
+    }
 
     std::thread::sleep(std::time::Duration::from_secs(3));
 
