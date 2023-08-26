@@ -151,7 +151,7 @@ async fn process(mut socket: TcpStream) -> ! {
             1 => "phone",
             2 => "tablet",
             3 => "laptop",
-            _ => "really unknown",
+            _ => "unknown2",
         };
         println!("device_type: {}", device_type);
 
@@ -165,10 +165,10 @@ async fn process(mut socket: TcpStream) -> ! {
         let m1 = buf.clone();
 
         let ukey2_message = Ukey2Message::parse_from_bytes(&buf).unwrap();
-        println!("uk2 msg: {:?}", ukey2_message);
+        println!("< {:?}", ukey2_message);
 
         let ukey2_client_init = Ukey2ClientInit::parse_from_bytes(ukey2_message.message_data()).unwrap();
-        println!("ukey2_client_init: {:?}", ukey2_client_init);
+        println!("< {:?}", ukey2_client_init);
 
         assert!(ukey2_client_init.next_protocol.unwrap() == "AES_256_CBC-HMAC_SHA256");
 
@@ -193,12 +193,9 @@ async fn process(mut socket: TcpStream) -> ! {
             special_fields: SpecialFields::default(),
         };
 
-        let bytes = server_init.write_to_bytes().unwrap();
-        let m2 = bytes.clone();
-        socket.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
-        socket.write_all(&bytes).await.unwrap();
-
+        println!("> {:?}", server_init);
         write_msg(&mut socket, &server_init).await;
+        let m2 = server_init.write_to_bytes().unwrap();
 
         // UKEY2 Client Finished
         let buf = read_msg(&mut socket).await;
@@ -206,14 +203,11 @@ async fn process(mut socket: TcpStream) -> ! {
         println!("uk2 alert: {:?}", Ukey2Alert::parse_from_bytes(&buf));
 
         let ukey2_message = Ukey2Message::parse_from_bytes(&buf).unwrap();
-        println!("uk2 msg: {:?}", ukey2_message);
+        println!("< {:?}", ukey2_message);
         assert_eq!(ukey2_message.message_type, Some(ukey2message::Type::CLIENT_FINISH.into()));
 
         // verify commitment hash
-        let mut hasher = Sha512::new();
-        hasher.update(buf);
-        let commitment_hash = hasher.finalize();
-        assert_eq!(commitment_hash.as_slice(), cipher.commitment());
+        assert_eq!(Sha512::digest(buf).as_slice(), cipher.commitment());
 
         let ukey2_client_finished = Ukey2ClientFinished::parse_from_bytes(ukey2_message.message_data()).unwrap();
 
@@ -267,17 +261,14 @@ async fn process(mut socket: TcpStream) -> ! {
             v1: MessageField::some(v1frame),
             special_fields: SpecialFields::default(),
         };
-        let bytes = connection_response.write_to_bytes().unwrap();
-        socket.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
-        socket.write_all(&bytes).await.unwrap();
+        write_msg(&mut socket, &connection_response).await;
 
         // key exchange complete
 
         // connection response from android?
         let buf = read_msg(&mut socket).await;
-
         let offline_frame = OfflineFrame::parse_from_bytes(&buf).unwrap();
-        dbg!(offline_frame);
+        println!("< {:?}", offline_frame);
 
         // paired key encryption
         let buf = read_msg(&mut socket).await;
@@ -286,7 +277,6 @@ async fn process(mut socket: TcpStream) -> ! {
         let secure_message = SecureMessage::parse_from_bytes(&buf).unwrap();
         let header_and_body = HeaderAndBody::parse_from_bytes(secure_message.header_and_body()).unwrap();
         let gcm_metadata = GcmMetadata::parse_from_bytes(header_and_body.header.public_metadata()).unwrap();
-        dbg!(&header_and_body, &gcm_metadata);
         assert_eq!(header_and_body.header.signature_scheme(), SigScheme::HMAC_SHA256);
         assert_eq!(gcm_metadata.type_(), securegcm::Type::DEVICE_TO_DEVICE_MESSAGE);
 
@@ -297,12 +287,8 @@ async fn process(mut socket: TcpStream) -> ! {
         let decryptor = cbc::Decryptor::<aes::Aes256>::new(decrypt_key.as_slice().into(), header_and_body.header.iv().into());
         let mut buf = vec![0u8; header_and_body.body().len()];
         let res = decryptor.decrypt_padded_b2b_mut::<Pkcs7>(header_and_body.body(), &mut buf).unwrap();
-        dbg!(&res);
-        std::fs::write("dec.buf", &res).unwrap();
 
         let d2dmsg = DeviceToDeviceMessage::parse_from_bytes(&res).unwrap();
-        dbg!(&d2dmsg);
-
         let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
         dbg!(&offline_frame);
 
