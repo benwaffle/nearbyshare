@@ -1,5 +1,7 @@
 include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 
+use std::io;
+
 use aes::cipher::{BlockDecryptMut, block_padding::Pkcs7, KeyIvInit, BlockEncryptMut};
 use hkdf::Hkdf;
 use hmac::Mac;
@@ -9,7 +11,7 @@ use p256::{ecdh::EphemeralSecret, EncodedPoint, elliptic_curve::{generic_array::
 use protobuf::{Message, SpecialFields, MessageField, Enum};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Sha512, Digest, Sha256};
-use tokio::{io::{Result, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 
 use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, v1frame::FrameType, payload_transfer_frame::{PacketType, payload_header::PayloadType, PayloadHeader, PayloadChunk, payload_chunk::Flags}, PayloadTransferFrame}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey, SecureMessage, HeaderAndBody, SigScheme, Header, EncScheme}, securegcm::GcmMetadata, device_to_device_messages::DeviceToDeviceMessage, wire_format::{Frame, frame, PairedKeyEncryptionFrame}};
 
@@ -120,6 +122,28 @@ fn sign_and_encrypt_d2d(encrypt_key: &[u8], send_hmac_key: &[u8], d2dmsg: &Devic
     securemessage
 }
 
+fn verify_and_decrypt_d2d(secure_message: SecureMessage, decrypt_key: &[u8], receive_hmac_key: &[u8]) -> Result<DeviceToDeviceMessage, Box<dyn std::error::Error>> {
+    let header_and_body = HeaderAndBody::parse_from_bytes(secure_message.header_and_body())?;
+
+    let gcm_metadata = GcmMetadata::parse_from_bytes(header_and_body.header.public_metadata())?;
+
+    if header_and_body.header.encryption_scheme() != EncScheme::AES_256_CBC {
+        return Err("unsupported encryption scheme".into());
+    }
+    if gcm_metadata.type_() != securegcm::Type::DEVICE_TO_DEVICE_MESSAGE {
+        return Err(format!("unsupported gcm type: {:?}", gcm_metadata.type_()).into());
+    }
+
+    let mut sig = hmac::Hmac::<Sha256>::new_from_slice(&receive_hmac_key).unwrap();
+    sig.update(secure_message.header_and_body());
+    sig.verify_slice(secure_message.signature())?;
+
+    let decryptor = Aes256CbcDec::new_from_slices(&decrypt_key, header_and_body.header.iv())?;
+    let res = decryptor.decrypt_padded_vec_mut::<Pkcs7>(header_and_body.body())?;
+
+    Ok(DeviceToDeviceMessage::parse_from_bytes(&res)?)
+}
+
 fn encode_payload_chunks(id: i64, data: &[u8]) -> Vec<OfflineFrame> {
     const MAX_CHUNK_SIZE: usize = 8 * 1024 * 1024; // TODO: pick a good value
     let mut res = vec![];
@@ -161,6 +185,45 @@ fn encode_payload_chunks(id: i64, data: &[u8]) -> Vec<OfflineFrame> {
     res.push(new_frame(id, data.len(), &[], data.len(), true));
 
     res
+}
+
+async fn read_full_payload_transfer(socket: &mut TcpStream, decrypt_key: &[u8], receive_hmac_key: &[u8]) -> Frame {
+    let mut frame_bytes: Vec<u8> = vec![];
+    let mut sequence_number = 0;
+    let mut id = None;
+
+    loop {
+        sequence_number += 1;
+
+        let buf = read_msg(socket).await;
+        let secure_message = SecureMessage::parse_from_bytes(&buf).unwrap();
+
+        let d2dmsg = verify_and_decrypt_d2d(secure_message, &decrypt_key, &receive_hmac_key).unwrap();
+        assert_eq!(d2dmsg.sequence_number(), sequence_number);
+
+        let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
+        assert_eq!(offline_frame.v1.type_(), FrameType::PAYLOAD_TRANSFER);
+        assert_eq!(offline_frame.v1.payload_transfer.packet_type(), PacketType::DATA);
+
+        let header = &offline_frame.v1.payload_transfer.payload_header;
+        assert_eq!(header.type_(), PayloadType::BYTES); // bytes means protobuf message
+        assert_eq!(offline_frame.v1.payload_transfer.payload_chunk.offset() as usize, frame_bytes.len());
+
+        if id == None {
+            id = Some(header.id());
+        } else {
+            assert_eq!(id, Some(header.id()));
+        }
+
+        let buf = offline_frame.v1.payload_transfer.payload_chunk.body();
+        frame_bytes.extend_from_slice(buf);
+
+        if offline_frame.v1.payload_transfer.payload_chunk.flags() & Flags::LAST_CHUNK.value() != 0 {
+            break;
+        }
+    }
+
+    Frame::parse_from_bytes(&frame_bytes).unwrap()
 }
 
 impl From<PublicKey> for securemessage::GenericPublicKey {
@@ -348,35 +411,8 @@ async fn process(mut socket: TcpStream) -> ! {
     println!("< {:?}", offline_frame);
 
     // paired key encryption
-    let buf = read_msg(&mut socket).await;
-    std::fs::write("enc.buf", &buf).unwrap();
-
-    let secure_message = SecureMessage::parse_from_bytes(&buf).unwrap();
-    let header_and_body = HeaderAndBody::parse_from_bytes(secure_message.header_and_body()).unwrap();
-    let gcm_metadata = GcmMetadata::parse_from_bytes(header_and_body.header.public_metadata()).unwrap();
-    assert_eq!(header_and_body.header.signature_scheme(), SigScheme::HMAC_SHA256);
-    assert_eq!(gcm_metadata.type_(), securegcm::Type::DEVICE_TO_DEVICE_MESSAGE);
-
-    let mut sig = hmac::Hmac::<Sha256>::new_from_slice(&receive_hmac_key).unwrap();
-    sig.update(secure_message.header_and_body());
-    sig.verify_slice(secure_message.signature()).unwrap();
-
-    let decryptor = Aes256CbcDec::new_from_slices(&decrypt_key, header_and_body.header.iv()).unwrap();
-    let res = decryptor.decrypt_padded_vec_mut::<Pkcs7>(header_and_body.body()).unwrap();
-
-    let d2dmsg = DeviceToDeviceMessage::parse_from_bytes(&res).unwrap();
-    let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
-    dbg!(&offline_frame);
-
-    assert_eq!(offline_frame.v1.type_(), FrameType::PAYLOAD_TRANSFER);
-    assert_eq!(offline_frame.v1.payload_transfer.packet_type(), PacketType::DATA);
-    assert_eq!(offline_frame.v1.payload_transfer.payload_header.type_(), PayloadType::BYTES); // bytes means protobuf message
-
-    let buf = offline_frame.v1.payload_transfer.payload_chunk.body();
-    let frame = Frame::parse_from_bytes(buf).unwrap();
+    let frame = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key).await;
     dbg!(frame);
-
-    // TODO: read multiple chunks
 
     // send paired key encryption
     let mut signed_data = vec![0u8; 72];
@@ -422,7 +458,7 @@ async fn process(mut socket: TcpStream) -> ! {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> io::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     println!("Listening on {}", listener.local_addr().unwrap());
     broadcast_mdns(listener.local_addr().unwrap().port());
