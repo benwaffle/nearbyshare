@@ -68,23 +68,77 @@ async fn read_msg_len(socket: &mut TcpStream) -> usize {
     let n = socket.read(&mut msg_len).await.unwrap();
     assert_eq!(n, 4);
 
-    let msg_len = u32::from_be_bytes(msg_len);
-    return msg_len as usize;
+    u32::from_be_bytes(msg_len) as usize
+}
+
+async fn read_msg(socket: &mut TcpStream) -> Vec<u8> {
+    let msg_len = read_msg_len(socket).await;
+    let mut buf = vec![0u8; msg_len];
+    socket.read(&mut buf).await.unwrap();
+    buf
 }
 
 fn do_hkdf(salt: &[u8], input_key: &[u8], info: &[u8], size: usize) -> Vec<u8> {
     let hkdf = Hkdf::<Sha256>::new(Some(salt), input_key);
     let mut okm = vec![0u8; size];
     hkdf.expand(info, &mut okm).unwrap();
-    return okm;
+    okm
+}
+
+impl From<PublicKey> for securemessage::GenericPublicKey {
+    fn from(public_key: PublicKey) -> Self {
+        let encoded = EncodedPoint::from(public_key);
+
+        let mut public_key_pb = GenericPublicKey::new();
+        public_key_pb.set_type(PublicKeyType::EC_P256.into());
+
+        let x = encoded.x().unwrap().to_vec();
+        let y = encoded.y().unwrap().to_vec();
+
+        // securemessage.proto requires two's complement. p256 gives unsigned encodings, so just prepend a 0.
+        let x = [vec![0u8], x].concat();
+        let y = [vec![0u8], y].concat();
+
+        public_key_pb.ec_p256_public_key = Some(EcP256PublicKey {
+            x: Some(x),
+            y: Some(y),
+            special_fields: SpecialFields::default(),
+        }).into();
+
+        public_key_pb
+    }
+}
+
+impl From<securemessage::GenericPublicKey> for PublicKey {
+    fn from(gpk: securemessage::GenericPublicKey) -> Self {
+        assert_eq!(gpk.type_(), PublicKeyType::EC_P256);
+
+        let x = gpk.ec_p256_public_key.x.as_ref().unwrap();
+        let y = gpk.ec_p256_public_key.y.as_ref().unwrap();
+        // cut off leading 0x00 byte from incoming two's complement ints, as p256 uses unsigned ints
+        let x = &x[x.len()-32..];
+        let y = &y[y.len()-32..];
+
+        // positive integers in two's complement are represented the same way as unsigned integers
+        let client_pub_key_pt = EncodedPoint::from_affine_coordinates(
+            GenericArray::<u8, p256::U32>::from_slice(x),
+            GenericArray::<u8, p256::U32>::from_slice(y),
+            false,
+        );
+        PublicKey::from_encoded_point(&client_pub_key_pt).unwrap()
+    }
+}
+
+async fn write_msg(socket: &mut TcpStream, message: &impl protobuf::Message) {
+    let bytes = message.write_to_bytes().unwrap();
+    socket.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+    socket.write_all(&bytes).await.unwrap();
 }
 
 async fn process(mut socket: TcpStream) -> ! {
     loop {
         // ConnectionRequestFrame
-        let msg_len = read_msg_len(&mut socket).await;
-        let mut buf = vec![0u8; msg_len];
-        socket.read(&mut buf).await.unwrap();
+        let buf = read_msg(&mut socket).await;
 
         let offline = OfflineFrame::parse_from_bytes(&buf).unwrap();
         println!("< {:?}", offline.v1.type_.unwrap());
@@ -106,9 +160,7 @@ async fn process(mut socket: TcpStream) -> ! {
         println!("device_name: {}", device_name);
 
         // UKEY2 Client Init
-        let msg_len = read_msg_len(&mut socket).await;
-        let mut buf = vec![0u8; msg_len];
-        socket.read(&mut buf).await.unwrap();
+        let buf = read_msg(&mut socket).await;
 
         let m1 = buf.clone();
 
@@ -123,23 +175,7 @@ async fn process(mut socket: TcpStream) -> ! {
         let cipher = ukey2_client_init.cipher_commitments.iter().find(|c| c.handshake_cipher() == Ukey2HandshakeCipher::P256_SHA512).unwrap();
 
         let secret_key = EphemeralSecret::random(&mut OsRng);
-        let encoded = EncodedPoint::from(secret_key.public_key());
-
-        let mut public_key_pb = GenericPublicKey::new();
-        public_key_pb.set_type(PublicKeyType::EC_P256.into());
-
-        let x = encoded.x().unwrap().to_vec();
-        let y = encoded.y().unwrap().to_vec();
-
-        // securemessage.proto requires two's complement. p256 gives unsigned encodings, so just prepend a 0.
-        let x = [vec![0u8], x].concat();
-        let y = [vec![0u8], y].concat();
-
-        public_key_pb.ec_p256_public_key = Some(EcP256PublicKey {
-            x: Some(x),
-            y: Some(y),
-            special_fields: SpecialFields::default(),
-        }).into();
+        let public_key_pb = GenericPublicKey::from(secret_key.public_key());
 
         let mut random = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut random);
@@ -162,10 +198,10 @@ async fn process(mut socket: TcpStream) -> ! {
         socket.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
         socket.write_all(&bytes).await.unwrap();
 
+        write_msg(&mut socket, &server_init).await;
+
         // UKEY2 Client Finished
-        let msg_len = read_msg_len(&mut socket).await;
-        let mut buf = vec![0u8; msg_len];
-        socket.read(&mut buf).await.unwrap();
+        let buf = read_msg(&mut socket).await;
 
         println!("uk2 alert: {:?}", Ukey2Alert::parse_from_bytes(&buf));
 
@@ -182,21 +218,7 @@ async fn process(mut socket: TcpStream) -> ! {
         let ukey2_client_finished = Ukey2ClientFinished::parse_from_bytes(ukey2_message.message_data()).unwrap();
 
         let client_pub_key = GenericPublicKey::parse_from_bytes(&ukey2_client_finished.public_key.unwrap()).unwrap();
-        assert_eq!(client_pub_key.type_, Some(PublicKeyType::EC_P256.into()));
-
-        let x = client_pub_key.ec_p256_public_key.x.as_ref().unwrap();
-        let y = client_pub_key.ec_p256_public_key.y.as_ref().unwrap();
-        // cut off leading 0x00 byte from incoming two's complement ints, as p256 uses unsigned ints
-        let x = &x[x.len()-32..];
-        let y = &y[y.len()-32..];
-
-        // positive integers in two's complement are represented the same way as unsigned integers
-        let client_pub_key_pt = EncodedPoint::from_affine_coordinates(
-            GenericArray::<u8, p256::U32>::from_slice(x),
-            GenericArray::<u8, p256::U32>::from_slice(y),
-            false,
-        );
-        let client_pub_key = PublicKey::from_encoded_point(&client_pub_key_pt).unwrap();
+        let client_pub_key = PublicKey::from(client_pub_key);
 
         let shared_secret = Sha256::digest(secret_key.diffie_hellman(&client_pub_key).raw_secret_bytes());
 
@@ -215,8 +237,8 @@ async fn process(mut socket: TcpStream) -> ! {
         let salt = hex::decode("BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E").unwrap();
         let decrypt_key = do_hkdf(&salt, &d2d_client_key, b"ENC:2", 32);
         let receive_hmac_key = do_hkdf(&salt, &d2d_client_key, b"SIG:1", 32);
-        let encrypt_key = do_hkdf(&salt, &d2d_server_key, b"ENC:2", 32);
-        let send_hmac_key = do_hkdf(&salt, &d2d_server_key, b"SIG:1", 32);
+        let _encrypt_key = do_hkdf(&salt, &d2d_server_key, b"ENC:2", 32);
+        let _send_hmac_key = do_hkdf(&salt, &d2d_server_key, b"SIG:1", 32);
 
         fn generate_pin_code(auth_string: &[u8]) -> String {
             let mut hash: i32 = 0;
@@ -252,18 +274,13 @@ async fn process(mut socket: TcpStream) -> ! {
         // key exchange complete
 
         // connection response from android?
-        let msg_len = read_msg_len(&mut socket).await;
-        let mut buf = vec![0u8; msg_len];
-        socket.read(&mut buf).await.unwrap();
+        let buf = read_msg(&mut socket).await;
 
         let offline_frame = OfflineFrame::parse_from_bytes(&buf).unwrap();
         dbg!(offline_frame);
 
         // paired key encryption
-        let msg_len = read_msg_len(&mut socket).await;
-        let mut buf = vec![0u8; msg_len];
-        socket.read(&mut buf).await.unwrap();
-        // write buf to msg.buf
+        let buf = read_msg(&mut socket).await;
         std::fs::write("enc.buf", &buf).unwrap();
 
         let secure_message = SecureMessage::parse_from_bytes(&buf).unwrap();
