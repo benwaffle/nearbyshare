@@ -13,7 +13,7 @@ use rand::{RngCore, rngs::OsRng};
 use sha2::{Sha512, Digest, Sha256};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 
-use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, v1frame::FrameType, payload_transfer_frame::{PacketType, payload_header::PayloadType, PayloadHeader, PayloadChunk, payload_chunk::Flags}, PayloadTransferFrame}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey, SecureMessage, HeaderAndBody, SigScheme, Header, EncScheme}, securegcm::GcmMetadata, device_to_device_messages::DeviceToDeviceMessage, wire_format::{Frame, frame, PairedKeyEncryptionFrame}};
+use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, v1frame::FrameType, payload_transfer_frame::{PacketType, payload_header::PayloadType, PayloadHeader, PayloadChunk, payload_chunk::Flags}, PayloadTransferFrame}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey, SecureMessage, HeaderAndBody, SigScheme, Header, EncScheme}, securegcm::GcmMetadata, device_to_device_messages::DeviceToDeviceMessage, wire_format::{Frame, frame, PairedKeyEncryptionFrame, paired_key_result_frame, PairedKeyResultFrame}};
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
@@ -187,19 +187,37 @@ fn encode_payload_chunks(id: i64, data: &[u8]) -> Vec<OfflineFrame> {
     res
 }
 
-async fn read_full_payload_transfer(socket: &mut TcpStream, decrypt_key: &[u8], receive_hmac_key: &[u8]) -> Frame {
+async fn send_frame(socket: &mut TcpStream, frame: &Frame, encrypt_key: &[u8], send_hmac_key: &[u8], server_seq_num: &mut i32) {
+    let data = frame.write_to_bytes().unwrap();
+
+    let id = rand::thread_rng().next_u64() as i64;
+    let frames = encode_payload_chunks(id, &data);
+
+    for frame in frames.iter() {
+        *server_seq_num += 1;
+
+        let mut d2dmsg = DeviceToDeviceMessage::new();
+        d2dmsg.set_sequence_number(*server_seq_num);
+        d2dmsg.set_message(frame.write_to_bytes().unwrap());
+
+        let securemessage = sign_and_encrypt_d2d(&encrypt_key, &send_hmac_key, &d2dmsg);
+        write_msg(socket, &securemessage).await;
+    }
+}
+
+async fn read_full_payload_transfer(socket: &mut TcpStream, decrypt_key: &[u8], receive_hmac_key: &[u8], client_seq_num: &mut i32) -> Frame {
     let mut frame_bytes: Vec<u8> = vec![];
-    let mut sequence_number = 0;
     let mut id = None;
 
     loop {
-        sequence_number += 1;
+        *client_seq_num += 1;
 
         let buf = read_msg(socket).await;
         let secure_message = SecureMessage::parse_from_bytes(&buf).unwrap();
 
         let d2dmsg = verify_and_decrypt_d2d(secure_message, &decrypt_key, &receive_hmac_key).unwrap();
-        assert_eq!(d2dmsg.sequence_number(), sequence_number);
+        dbg!(d2dmsg.sequence_number());
+        assert_eq!(d2dmsg.sequence_number(), *client_seq_num);
 
         let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
         assert_eq!(offline_frame.v1.type_(), FrameType::PAYLOAD_TRANSFER);
@@ -257,6 +275,7 @@ impl From<securemessage::GenericPublicKey> for PublicKey {
         let x = gpk.ec_p256_public_key.x.as_ref().unwrap();
         let y = gpk.ec_p256_public_key.y.as_ref().unwrap();
         // cut off leading 0x00 byte from incoming two's complement ints, as p256 uses unsigned ints
+        // TODO: handle lengths shorter than 32 bytes
         let x = &x[x.len()-32..];
         let y = &y[y.len()-32..];
 
@@ -410,8 +429,11 @@ async fn process(mut socket: TcpStream) -> ! {
     let offline_frame = OfflineFrame::parse_from_bytes(&buf).unwrap();
     println!("< {:?}", offline_frame);
 
+    let mut server_seq_num = 0i32;
+    let mut client_seq_num = 0i32;
+
     // paired key encryption
-    let frame = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key).await;
+    let frame = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await;
     dbg!(frame);
 
     // send paired key encryption
@@ -433,24 +455,27 @@ async fn process(mut socket: TcpStream) -> ! {
     frame.set_version(frame::Version::V1);
     frame.v1 = Some(v1frame).into();
 
-    // payload layer
-    let data = frame.write_to_bytes().unwrap();
+    send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
 
-    let id = 12345;
-    let frames = encode_payload_chunks(id, &data);
+    let frame = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await;
+    dbg!(frame);
 
-    let mut server_seq_num = 0;
+    // paired key result
+    let mut paired_key_result = PairedKeyResultFrame::new();
+    paired_key_result.set_status(paired_key_result_frame::Status::UNABLE);
 
-    for frame in frames.iter() {
-        server_seq_num += 1;
+    let mut v1frame = wire_format::V1Frame::new();
+    v1frame.set_type(wire_format::v1frame::FrameType::PAIRED_KEY_RESULT);
+    v1frame.paired_key_result = Some(paired_key_result).into();
 
-        let mut d2dmsg = DeviceToDeviceMessage::new();
-        d2dmsg.set_sequence_number(server_seq_num);
-        d2dmsg.set_message(frame.write_to_bytes().unwrap());
+    let mut frame = wire_format::Frame::new();
+    frame.set_version(frame::Version::V1);
+    frame.v1 = Some(v1frame).into();
 
-        let securemessage = sign_and_encrypt_d2d(&encrypt_key, &send_hmac_key, &d2dmsg);
-        write_msg(&mut socket, &securemessage).await;
-    }
+    send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
+
+    let frame = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await;
+    dbg!(frame);
 
     std::thread::sleep(std::time::Duration::from_secs(3));
 
