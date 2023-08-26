@@ -146,7 +146,7 @@ fn encode_payload_chunks(id: i64, data: &[u8]) -> Vec<OfflineFrame> {
 
         let mut frame = OfflineFrame::new();
         frame.set_version(offline_frame::Version::V1);
-        frame.v1 = Some(offline_wire_formats::V1Frame::new()).into();
+        frame.v1 = Some(v1frame).into();
 
         frame
     }
@@ -403,10 +403,13 @@ async fn process(mut socket: TcpStream) -> ! {
     let id = 12345;
     let frames = encode_payload_chunks(id, &data);
 
-    for (i, frame) in frames.iter().enumerate() {
-        // encryption layer
+    let mut server_seq_num = 0;
+
+    for frame in frames.iter() {
+        server_seq_num += 1;
+
         let mut d2dmsg = DeviceToDeviceMessage::new();
-        d2dmsg.set_sequence_number((i + 1) as i32);
+        d2dmsg.set_sequence_number(server_seq_num);
         d2dmsg.set_message(frame.write_to_bytes().unwrap());
 
         let securemessage = sign_and_encrypt_d2d(&encrypt_key, &send_hmac_key, &d2dmsg);
