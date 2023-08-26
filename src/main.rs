@@ -198,15 +198,15 @@ async fn process(mut socket: TcpStream) -> ! {
         );
         let client_pub_key = PublicKey::from_encoded_point(&client_pub_key_pt).unwrap();
 
-        let shared_secret = secret_key.diffie_hellman(&client_pub_key);
+        let shared_secret = Sha256::digest(secret_key.diffie_hellman(&client_pub_key).raw_secret_bytes());
 
         // deriving keys
         let m3 = [m1, m2].concat();
 
-        let authentication_string = do_hkdf(b"UKEY2 v1 auth", shared_secret.raw_secret_bytes(), &m3, 32);
-        let next_protocol_secret = do_hkdf(b"UKEY2 v1 next", shared_secret.raw_secret_bytes(), &m3, 32);
+        let authentication_string = do_hkdf(b"UKEY2 v1 auth", &shared_secret, &m3, 32);
+        let next_protocol_secret = do_hkdf(b"UKEY2 v1 next", &shared_secret, &m3, 32);
 
-        // device-to-device client key
+        // this is sha256("D2D")
         let d2d_salt = hex::decode("82AA55A0D397F88346CA1CEE8D3909B95F13FA7DEB1D4AB38376B8256DA85510").unwrap();
         let d2d_client_key = do_hkdf(&d2d_salt, &next_protocol_secret, b"client", 32);
         let d2d_server_key = do_hkdf(&d2d_salt, &next_protocol_secret, b"server", 32);
@@ -275,15 +275,15 @@ async fn process(mut socket: TcpStream) -> ! {
 
         let mut sig = hmac::Hmac::<Sha256>::new_from_slice(&receive_hmac_key).unwrap();
         sig.update(secure_message.header_and_body());
-        dbg!(sig.finalize().into_bytes(), secure_message.signature());
+        sig.verify_slice(secure_message.signature()).unwrap();
 
         let decryptor = cbc::Decryptor::<aes::Aes256>::new(decrypt_key.as_slice().into(), header_and_body.header.iv().into());
         let mut buf = vec![0u8; header_and_body.body().len()];
-        decryptor.decrypt_padded_mut::<Pkcs7>(&mut buf).unwrap();
-        dbg!(&buf);
-        std::fs::write("dec.buf", &buf).unwrap();
+        let res = decryptor.decrypt_padded_b2b_mut::<Pkcs7>(header_and_body.body(), &mut buf).unwrap();
+        dbg!(&res);
+        std::fs::write("dec.buf", &res).unwrap();
 
-        let d2dmsg = DeviceToDeviceMessage::parse_from_bytes(&buf).unwrap();
+        let d2dmsg = DeviceToDeviceMessage::parse_from_bytes(&res).unwrap();
         dbg!(d2dmsg);
 
         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -301,4 +301,16 @@ async fn main() -> Result<()> {
     start_server(listener).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slice() {
+        let asdf = "abcdef";
+        let x = &asdf[asdf.len()-2..];
+        assert_eq!(x, "ef");
+    }
 }
