@@ -362,8 +362,7 @@ async fn process(mut socket: TcpStream) -> ! {
     sig.verify_slice(secure_message.signature()).unwrap();
 
     let decryptor = Aes256CbcDec::new_from_slices(&decrypt_key, header_and_body.header.iv()).unwrap();
-    let mut buf = vec![0u8; header_and_body.body().len()];
-    let res = decryptor.decrypt_padded_b2b_mut::<Pkcs7>(header_and_body.body(), &mut buf).unwrap();
+    let res = decryptor.decrypt_padded_vec_mut::<Pkcs7>(header_and_body.body()).unwrap();
 
     let d2dmsg = DeviceToDeviceMessage::parse_from_bytes(&res).unwrap();
     let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
