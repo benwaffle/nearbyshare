@@ -11,7 +11,7 @@ use sha2::{Sha512, Digest, Sha256};
 use tokio::{io::{Result, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 use hmac::{Mac};
 
-use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, V1Frame, v1frame::FrameType}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey, SecureMessage, HeaderAndBody, SigScheme}, securegcm::GcmMetadata, device_to_device_messages::DeviceToDeviceMessage};
+use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, V1Frame, v1frame::FrameType, payload_transfer_frame::{PacketType, payload_header::PayloadType}}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey, SecureMessage, HeaderAndBody, SigScheme}, securegcm::GcmMetadata, device_to_device_messages::DeviceToDeviceMessage, wire_format::Frame};
 
 fn b64(bytes: &[u8]) -> String {
     let str = general_purpose::STANDARD.encode(bytes);
@@ -284,7 +284,18 @@ async fn process(mut socket: TcpStream) -> ! {
         std::fs::write("dec.buf", &res).unwrap();
 
         let d2dmsg = DeviceToDeviceMessage::parse_from_bytes(&res).unwrap();
-        dbg!(d2dmsg);
+        dbg!(&d2dmsg);
+
+        let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
+        dbg!(&offline_frame);
+
+        assert_eq!(offline_frame.v1.type_(), FrameType::PAYLOAD_TRANSFER);
+        assert_eq!(offline_frame.v1.payload_transfer.packet_type(), PacketType::DATA);
+        assert_eq!(offline_frame.v1.payload_transfer.payload_header.type_(), PayloadType::BYTES); // bytes means protobuf message
+
+        let buf = offline_frame.v1.payload_transfer.payload_chunk.body();
+        let frame = Frame::parse_from_bytes(buf).unwrap();
+        dbg!(frame);
 
         std::thread::sleep(std::time::Duration::from_secs(3));
 
