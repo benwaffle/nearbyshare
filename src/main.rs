@@ -21,9 +21,9 @@ type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
 fn b64(bytes: &[u8]) -> String {
     let str = general_purpose::STANDARD.encode(bytes);
-    return str.replace("=", "")
-              .replace("/", "_")
-              .replace("+", "-");
+    str.replace('=', "")
+       .replace('/', "_")
+       .replace('+', "-")
 }
 
 fn broadcast_mdns(port: u16) {
@@ -64,7 +64,7 @@ async fn start_server(listener: TcpListener) {
     loop {
         let (socket, _) = listener.accept().await.unwrap();
         tokio::spawn(async move {
-            process(socket).await;
+            process(socket).await.unwrap();
         });
     }
 }
@@ -99,7 +99,7 @@ fn sign_and_encrypt_d2d(encrypt_key: &[u8], send_hmac_key: &[u8], d2dmsg: &Devic
     let mut iv = vec![0u8; 16];
     rand::thread_rng().fill_bytes(&mut iv);
 
-    let encryptor = Aes256CbcEnc::new_from_slices(&encrypt_key, &iv).unwrap();
+    let encryptor = Aes256CbcEnc::new_from_slices(encrypt_key, &iv).unwrap();
     let encrypted = encryptor.encrypt_padded_vec_mut::<Pkcs7>(&d2dmsg.write_to_bytes().unwrap());
 
     let mut gcm_metadata = GcmMetadata::new();
@@ -117,12 +117,12 @@ fn sign_and_encrypt_d2d(encrypt_key: &[u8], send_hmac_key: &[u8], d2dmsg: &Devic
     header_and_body.body = Some(encrypted);
 
     let header_and_body_bytes = header_and_body.write_to_bytes().unwrap();
-    let mut hmac = hmac::Hmac::<Sha256>::new_from_slice(&send_hmac_key).unwrap();
+    let mut hmac = hmac::Hmac::<Sha256>::new_from_slice(send_hmac_key).unwrap();
     hmac.update(&header_and_body_bytes);
 
     let mut securemessage = SecureMessage::new();
-    securemessage.header_and_body = Some(header_and_body.write_to_bytes().unwrap()).into();
-    securemessage.signature = Some(hmac.finalize().into_bytes().to_vec()).into();
+    securemessage.header_and_body = Some(header_and_body.write_to_bytes().unwrap());
+    securemessage.signature = Some(hmac.finalize().into_bytes().to_vec());
 
     securemessage
 }
@@ -139,11 +139,11 @@ fn verify_and_decrypt_d2d(secure_message: SecureMessage, decrypt_key: &[u8], rec
         return Err(format!("unsupported gcm type: {:?}", gcm_metadata.type_()).into());
     }
 
-    let mut sig = hmac::Hmac::<Sha256>::new_from_slice(&receive_hmac_key).unwrap();
+    let mut sig = hmac::Hmac::<Sha256>::new_from_slice(receive_hmac_key).unwrap();
     sig.update(secure_message.header_and_body());
     sig.verify_slice(secure_message.signature())?;
 
-    let decryptor = Aes256CbcDec::new_from_slices(&decrypt_key, header_and_body.header.iv())?;
+    let decryptor = Aes256CbcDec::new_from_slices(decrypt_key, header_and_body.header.iv())?;
     let res = decryptor.decrypt_padded_vec_mut::<Pkcs7>(header_and_body.body())?;
 
     Ok(DeviceToDeviceMessage::parse_from_bytes(&res)?)
@@ -162,7 +162,7 @@ fn encode_payload_chunks(id: i64, data: &[u8]) -> Vec<OfflineFrame> {
         let mut payload_chunk = PayloadChunk::new();
         payload_chunk.set_offset(offset as i64);
         payload_chunk.set_flags(if last { Flags::LAST_CHUNK.value() } else { 0 });
-        payload_chunk.body = Some(chunk.to_vec()).into();
+        payload_chunk.body = Some(chunk.to_vec());
 
         let mut payload_transfer_frame = PayloadTransferFrame::new();
         payload_transfer_frame.set_packet_type(PacketType::DATA);
@@ -205,7 +205,7 @@ async fn send_frame(socket: &mut TcpStream, frame: &Frame, encrypt_key: &[u8], s
         d2dmsg.set_sequence_number(*server_seq_num);
         d2dmsg.set_message(frame.write_to_bytes().unwrap());
 
-        let securemessage = sign_and_encrypt_d2d(&encrypt_key, &send_hmac_key, &d2dmsg);
+        let securemessage = sign_and_encrypt_d2d(encrypt_key, send_hmac_key, &d2dmsg);
         write_msg(socket, &securemessage).await;
     }
 }
@@ -229,11 +229,9 @@ async fn read_next_transfer(transfers: &mut HashMap<i64, TransferState>, socket:
     *client_seq_num += 1;
 
     let buf = read_msg(socket).await;
-    //std::fs::File::create(format!("raw{}.buf", *client_seq_num)).unwrap().write_all(&buf).unwrap();
     let secure_message = SecureMessage::parse_from_bytes(&buf).unwrap();
 
-    let d2dmsg = verify_and_decrypt_d2d(secure_message, &decrypt_key, &receive_hmac_key).unwrap();
-    //std::fs::File::create(format!("d2dmsg{}.buf", *client_seq_num)).unwrap().write_all(d2dmsg.message()).unwrap();
+    let d2dmsg = verify_and_decrypt_d2d(secure_message, decrypt_key, receive_hmac_key).unwrap();
     assert_eq!(d2dmsg.sequence_number(), *client_seq_num);
 
     let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
@@ -290,7 +288,7 @@ impl From<PublicKey> for securemessage::GenericPublicKey {
         let encoded = EncodedPoint::from(public_key);
 
         let mut public_key_pb = GenericPublicKey::new();
-        public_key_pb.set_type(PublicKeyType::EC_P256.into());
+        public_key_pb.set_type(PublicKeyType::EC_P256);
 
         let x = encoded.x().unwrap().to_vec();
         let y = encoded.y().unwrap().to_vec();
@@ -441,7 +439,7 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
             hash = (hash + (*byte as i8 as i32) * multiplier) % 9973;
             multiplier = (multiplier * 31) % 9973;
         }
-        return format!("{:04}", hash.abs());
+        format!("{:04}", hash.abs())
     }
 
     // Connection Response
@@ -451,7 +449,7 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
     connection_response.os_info = MessageField::some(OsInfo { type_: Some(OsType::LINUX.into()), special_fields: SpecialFields::default() });
 
     let mut v1frame = offline_wire_formats::V1Frame::new();
-    v1frame.set_type(FrameType::CONNECTION_RESPONSE.into());
+    v1frame.set_type(FrameType::CONNECTION_RESPONSE);
     v1frame.connection_response = MessageField::some(connection_response);
 
     let connection_response = OfflineFrame {
@@ -613,12 +611,7 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
                 dbg!(frame);
             },
             TransferResult::Bytes(id, data) => {
-                dbg!(id, files);
-                if data.len() > 100 {
-                    dbg!(&data[..100]);
-                } else {
-                    dbg!(&data);
-                }
+                dbg!(id);
 
                 let file = files.iter().find(|f| f.payload_id() == id).unwrap();
                 println!("received file: {} {:?}", file.name(), file.type_());
