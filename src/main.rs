@@ -336,7 +336,7 @@ async fn write_msg(socket: &mut TcpStream, message: &impl protobuf::Message) {
     socket.write_all(&bytes).await.unwrap();
 }
 
-async fn process(mut socket: TcpStream) -> ! {
+async fn process(mut socket: TcpStream) -> io::Result<()> {
     // ConnectionRequestFrame
     let buf = read_msg(&mut socket).await;
 
@@ -597,6 +597,8 @@ async fn process(mut socket: TcpStream) -> ! {
 
     send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
 
+    let mut received_files = 0;
+
     loop {
         match read_next_transfer(
             &mut transfers,
@@ -621,9 +623,18 @@ async fn process(mut socket: TcpStream) -> ! {
                 let file = files.iter().find(|f| f.payload_id() == id).unwrap();
                 println!("received file: {} {:?}", file.name(), file.type_());
                 std::fs::File::create(file.name()).unwrap().write_all(&data).unwrap();
+                received_files += 1;
+
+                if received_files == files.len() {
+                    break
+                }
             },
         }
     }
+
+    println!("All done");
+    socket.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::main]
