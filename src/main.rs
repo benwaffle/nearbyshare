@@ -7,6 +7,7 @@ use hkdf::Hkdf;
 use hmac::Mac;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use base64::{engine::general_purpose, Engine as _};
+use offline_wire_formats::KeepAliveFrame;
 use p256::{ecdh::EphemeralSecret, EncodedPoint, elliptic_curve::{generic_array::GenericArray, sec1::FromEncodedPoint}, PublicKey};
 use protobuf::{Message, SpecialFields, MessageField, Enum};
 use rand::{RngCore, rngs::OsRng};
@@ -78,7 +79,6 @@ async fn read_msg_len(socket: &mut TcpStream) -> usize {
 
 async fn read_msg(socket: &mut TcpStream) -> Vec<u8> {
     let msg_len = read_msg_len(socket).await;
-    dbg!(msg_len);
     let mut buf = vec![0u8; msg_len];
     let mut read = 0;
     while read < msg_len {
@@ -211,64 +211,6 @@ async fn send_frame(socket: &mut TcpStream, frame: &Frame, encrypt_key: &[u8], s
 }
 
 #[derive(Debug)]
-enum Payload {
-    Frame(wire_format::Frame),
-    Bytes(Vec<u8>),
-}
-
-async fn read_full_payload_transfer(socket: &mut TcpStream, decrypt_key: &[u8], receive_hmac_key: &[u8], client_seq_num: &mut i32) -> Payload {
-    let mut payload_bytes: Vec<u8> = vec![];
-    let mut id = None;
-    let mut payload_type = None;
-
-    loop {
-        *client_seq_num += 1;
-
-        let buf = read_msg(socket).await;
-        std::fs::File::create(format!("raw{}.buf", *client_seq_num)).unwrap().write_all(&buf).unwrap();
-        let secure_message = SecureMessage::parse_from_bytes(&buf).unwrap();
-
-        let d2dmsg = verify_and_decrypt_d2d(secure_message, &decrypt_key, &receive_hmac_key).unwrap();
-        std::fs::File::create(format!("d2dmsg{}.buf", *client_seq_num)).unwrap().write_all(d2dmsg.message()).unwrap();
-        assert_eq!(d2dmsg.sequence_number(), *client_seq_num);
-
-        let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
-        println!("offline_frame: {:?}", offline_frame);
-        assert_eq!(offline_frame.v1.type_(), FrameType::PAYLOAD_TRANSFER);
-        assert_eq!(offline_frame.v1.payload_transfer.packet_type(), PacketType::DATA);
-
-        let header = &offline_frame.v1.payload_transfer.payload_header;
-        assert_eq!(offline_frame.v1.payload_transfer.payload_chunk.offset() as usize, payload_bytes.len());
-
-        if payload_type == None {
-            payload_type = Some(header.type_());
-        } else {
-            assert_eq!(payload_type, Some(header.type_()));
-        }
-
-        if id == None {
-            id = Some(header.id());
-        } else {
-            assert_eq!(id, Some(header.id()));
-        }
-
-        let buf = offline_frame.v1.payload_transfer.payload_chunk.body();
-        payload_bytes.extend_from_slice(buf);
-
-        if offline_frame.v1.payload_transfer.payload_chunk.flags() & Flags::LAST_CHUNK.value() != 0 {
-            break;
-        }
-    }
-
-    dbg!(payload_bytes.len());
-    match payload_type {
-        Some(PayloadType::BYTES) => Payload::Frame(Frame::parse_from_bytes(&payload_bytes).unwrap()),
-        Some(PayloadType::FILE) => Payload::Bytes(payload_bytes),
-        _ => panic!("unknown payload type {:?}", payload_type),
-    }
-}
-
-#[derive(Debug)]
 struct TransferState {
     data: Vec<u8>,
     typ: PayloadType,
@@ -283,7 +225,7 @@ enum TransferResult {
 }
 
 async fn read_next_transfer(transfers: &mut HashMap<i64, TransferState>, socket: &mut TcpStream, decrypt_key: &[u8], receive_hmac_key: &[u8], client_seq_num: &mut i32) -> TransferResult {
-    dbg!("---------------------------------------------\n\n");
+    println!("---------------------------------------------\n\n");
     *client_seq_num += 1;
 
     let buf = read_msg(socket).await;
@@ -295,7 +237,10 @@ async fn read_next_transfer(transfers: &mut HashMap<i64, TransferState>, socket:
     assert_eq!(d2dmsg.sequence_number(), *client_seq_num);
 
     let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
-    println!("offline_frame: {:?}", offline_frame);
+    if offline_frame.v1.type_() == FrameType::KEEP_ALIVE {
+        return TransferResult::Keepalive;
+    }
+
     assert_eq!(offline_frame.v1.type_(), FrameType::PAYLOAD_TRANSFER);
     assert_eq!(offline_frame.v1.payload_transfer.packet_type(), PacketType::DATA);
 
@@ -323,6 +268,21 @@ async fn read_next_transfer(transfers: &mut HashMap<i64, TransferState>, socket:
     }
 
     TransferResult::Nothing
+}
+
+async fn reply_keepalive(socket: &mut TcpStream) {
+    let mut keepalive = KeepAliveFrame::new();
+    keepalive.set_ack(true);
+
+    let mut v1frame = offline_wire_formats::V1Frame::new();
+    v1frame.set_type(offline_wire_formats::v1frame::FrameType::KEEP_ALIVE);
+    v1frame.keep_alive = Some(keepalive).into();
+
+    let mut frame = OfflineFrame::new();
+    frame.set_version(offline_frame::Version::V1);
+    frame.v1 = Some(v1frame).into();
+
+    write_msg(socket, &frame).await;
 }
 
 impl From<PublicKey> for securemessage::GenericPublicKey {
@@ -510,12 +470,26 @@ async fn process(mut socket: TcpStream) -> ! {
 
     let mut server_seq_num = 0i32;
     let mut client_seq_num = 0i32;
+    let mut transfers = HashMap::new();
 
     // paired key encryption
-    let Payload::Frame(frame) = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await else {
-        panic!("expected frame")
-    };
-    println!("< {:?}", frame);
+    loop {
+        match read_next_transfer(
+            &mut transfers,
+            &mut socket,
+            &decrypt_key,
+            &receive_hmac_key,
+            &mut client_seq_num,
+        ).await {
+            TransferResult::Nothing => {},
+            TransferResult::Frame(frame) => {
+                println!("< {:?}", frame);
+                break
+            },
+            TransferResult::Bytes(id, data) => panic!("unexpected file {} {:?}", id, data),
+            TransferResult::Keepalive => reply_keepalive(&mut socket).await,
+        }
+    }
 
     // send paired key encryption
     let mut signed_data = vec![0u8; 72];
@@ -538,10 +512,23 @@ async fn process(mut socket: TcpStream) -> ! {
 
     send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
 
-    let Payload::Frame(frame) = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await else {
-        panic!("expected frame")
-    };
-    println!("< {:?}", frame);
+    loop {
+        match read_next_transfer(
+            &mut transfers,
+            &mut socket,
+            &decrypt_key,
+            &receive_hmac_key,
+            &mut client_seq_num,
+        ).await {
+            TransferResult::Nothing => {},
+            TransferResult::Frame(frame) => {
+                println!("< {:?}", frame);
+                break
+            },
+            TransferResult::Bytes(id, data) => panic!("unexpected file {} {:?}", id, data),
+            TransferResult::Keepalive => reply_keepalive(&mut socket).await,
+        }
+    }
 
     // paired key result
     let mut paired_key_result = PairedKeyResultFrame::new();
@@ -557,12 +544,25 @@ async fn process(mut socket: TcpStream) -> ! {
 
     send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
 
-    let Payload::Frame(frame) = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await else {
-        panic!("expected frame")
+    let intro_frame = loop {
+        match read_next_transfer(
+            &mut transfers,
+            &mut socket,
+            &decrypt_key,
+            &receive_hmac_key,
+            &mut client_seq_num,
+        ).await {
+            TransferResult::Nothing => {},
+            TransferResult::Frame(frame) => {
+                println!("< {:?}", frame);
+                break frame
+            },
+            TransferResult::Bytes(id, data) => panic!("unexpected file {} {:?}", id, data),
+            TransferResult::Keepalive => reply_keepalive(&mut socket).await,
+        }
     };
-    println!("< {:?}", frame);
-    assert_eq!(frame.v1.type_(), wire_format::v1frame::FrameType::INTRODUCTION);
-    let files = &frame.v1.introduction.file_metadata;
+    assert_eq!(intro_frame.v1.type_(), wire_format::v1frame::FrameType::INTRODUCTION);
+    let files = &intro_frame.v1.introduction.file_metadata;
     for file in files {
         let filename = file.name();
         let typ = file.type_();
@@ -597,7 +597,6 @@ async fn process(mut socket: TcpStream) -> ! {
 
     send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
 
-    let mut transfers = HashMap::new();
     loop {
         match read_next_transfer(
             &mut transfers,
@@ -607,7 +606,7 @@ async fn process(mut socket: TcpStream) -> ! {
             &mut client_seq_num,
         ).await {
             TransferResult::Nothing => {},
-            TransferResult::Keepalive => panic!("keepalive"),
+            TransferResult::Keepalive => reply_keepalive(&mut socket).await,
             TransferResult::Frame(frame) => {
                 dbg!(frame);
             },
