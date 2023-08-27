@@ -314,8 +314,8 @@ async fn read_next_transfer(transfers: &mut HashMap<i64, TransferState>, socket:
     if offline_frame.v1.payload_transfer.payload_chunk.flags() & Flags::LAST_CHUNK.value() != 0 {
         let transfer = transfers.remove(&header.id()).unwrap();
         let res = match transfer.typ {
-            PayloadType::BYTES => TransferResult::Bytes(header.id(), transfer.data),
-            PayloadType::FILE => TransferResult::Frame(Frame::parse_from_bytes(&transfer.data).unwrap()),
+            PayloadType::BYTES => TransferResult::Frame(Frame::parse_from_bytes(&transfer.data).unwrap()),
+            PayloadType::FILE  => TransferResult::Bytes(header.id(), transfer.data),
             _ => panic!("unknown payload type {:?}", transfer.typ),
         };
         //println!("transfer complete: {:?}", res);
