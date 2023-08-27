@@ -1,6 +1,6 @@
 include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 
-use std::io;
+use std::{io::{self, Write}, collections::HashMap};
 
 use aes::cipher::{BlockDecryptMut, block_padding::Pkcs7, KeyIvInit, BlockEncryptMut};
 use hkdf::Hkdf;
@@ -78,8 +78,13 @@ async fn read_msg_len(socket: &mut TcpStream) -> usize {
 
 async fn read_msg(socket: &mut TcpStream) -> Vec<u8> {
     let msg_len = read_msg_len(socket).await;
+    dbg!(msg_len);
     let mut buf = vec![0u8; msg_len];
-    socket.read(&mut buf).await.unwrap();
+    let mut read = 0;
+    while read < msg_len {
+        let n = socket.read(&mut buf[read..]).await.unwrap();
+        read += n;
+    }
     buf
 }
 
@@ -205,27 +210,41 @@ async fn send_frame(socket: &mut TcpStream, frame: &Frame, encrypt_key: &[u8], s
     }
 }
 
-async fn read_full_payload_transfer(socket: &mut TcpStream, decrypt_key: &[u8], receive_hmac_key: &[u8], client_seq_num: &mut i32) -> Frame {
-    let mut frame_bytes: Vec<u8> = vec![];
+#[derive(Debug)]
+enum Payload {
+    Frame(wire_format::Frame),
+    Bytes(Vec<u8>),
+}
+
+async fn read_full_payload_transfer(socket: &mut TcpStream, decrypt_key: &[u8], receive_hmac_key: &[u8], client_seq_num: &mut i32) -> Payload {
+    let mut payload_bytes: Vec<u8> = vec![];
     let mut id = None;
+    let mut payload_type = None;
 
     loop {
         *client_seq_num += 1;
 
         let buf = read_msg(socket).await;
+        std::fs::File::create(format!("raw{}.buf", *client_seq_num)).unwrap().write_all(&buf).unwrap();
         let secure_message = SecureMessage::parse_from_bytes(&buf).unwrap();
 
         let d2dmsg = verify_and_decrypt_d2d(secure_message, &decrypt_key, &receive_hmac_key).unwrap();
-        dbg!(d2dmsg.sequence_number());
+        std::fs::File::create(format!("d2dmsg{}.buf", *client_seq_num)).unwrap().write_all(d2dmsg.message()).unwrap();
         assert_eq!(d2dmsg.sequence_number(), *client_seq_num);
 
         let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
+        println!("offline_frame: {:?}", offline_frame);
         assert_eq!(offline_frame.v1.type_(), FrameType::PAYLOAD_TRANSFER);
         assert_eq!(offline_frame.v1.payload_transfer.packet_type(), PacketType::DATA);
 
         let header = &offline_frame.v1.payload_transfer.payload_header;
-        assert_eq!(header.type_(), PayloadType::BYTES); // bytes means protobuf message
-        assert_eq!(offline_frame.v1.payload_transfer.payload_chunk.offset() as usize, frame_bytes.len());
+        assert_eq!(offline_frame.v1.payload_transfer.payload_chunk.offset() as usize, payload_bytes.len());
+
+        if payload_type == None {
+            payload_type = Some(header.type_());
+        } else {
+            assert_eq!(payload_type, Some(header.type_()));
+        }
 
         if id == None {
             id = Some(header.id());
@@ -234,14 +253,76 @@ async fn read_full_payload_transfer(socket: &mut TcpStream, decrypt_key: &[u8], 
         }
 
         let buf = offline_frame.v1.payload_transfer.payload_chunk.body();
-        frame_bytes.extend_from_slice(buf);
+        payload_bytes.extend_from_slice(buf);
 
         if offline_frame.v1.payload_transfer.payload_chunk.flags() & Flags::LAST_CHUNK.value() != 0 {
             break;
         }
     }
 
-    Frame::parse_from_bytes(&frame_bytes).unwrap()
+    dbg!(payload_bytes.len());
+    match payload_type {
+        Some(PayloadType::BYTES) => Payload::Frame(Frame::parse_from_bytes(&payload_bytes).unwrap()),
+        Some(PayloadType::FILE) => Payload::Bytes(payload_bytes),
+        _ => panic!("unknown payload type {:?}", payload_type),
+    }
+}
+
+#[derive(Debug)]
+struct TransferState {
+    data: Vec<u8>,
+    typ: PayloadType,
+}
+
+#[derive(Debug)]
+enum TransferResult {
+    Nothing,
+    Frame(wire_format::Frame),
+    Bytes(i64, Vec<u8>),
+    Keepalive,
+}
+
+async fn read_next_transfer(transfers: &mut HashMap<i64, TransferState>, socket: &mut TcpStream, decrypt_key: &[u8], receive_hmac_key: &[u8], client_seq_num: &mut i32) -> TransferResult {
+    dbg!("---------------------------------------------\n\n");
+    *client_seq_num += 1;
+
+    let buf = read_msg(socket).await;
+    //std::fs::File::create(format!("raw{}.buf", *client_seq_num)).unwrap().write_all(&buf).unwrap();
+    let secure_message = SecureMessage::parse_from_bytes(&buf).unwrap();
+
+    let d2dmsg = verify_and_decrypt_d2d(secure_message, &decrypt_key, &receive_hmac_key).unwrap();
+    //std::fs::File::create(format!("d2dmsg{}.buf", *client_seq_num)).unwrap().write_all(d2dmsg.message()).unwrap();
+    assert_eq!(d2dmsg.sequence_number(), *client_seq_num);
+
+    let offline_frame = OfflineFrame::parse_from_bytes(d2dmsg.message()).unwrap();
+    println!("offline_frame: {:?}", offline_frame);
+    assert_eq!(offline_frame.v1.type_(), FrameType::PAYLOAD_TRANSFER);
+    assert_eq!(offline_frame.v1.payload_transfer.packet_type(), PacketType::DATA);
+
+    let header = &offline_frame.v1.payload_transfer.payload_header;
+
+    let transfer = transfers.entry(header.id()).or_insert_with(|| TransferState {
+        data: vec![],
+        typ: header.type_()
+    });
+    assert_eq!(offline_frame.v1.payload_transfer.payload_chunk.offset() as usize, transfer.data.len());
+    assert_eq!(transfer.typ, header.type_());
+
+    let buf = offline_frame.v1.payload_transfer.payload_chunk.body();
+    transfer.data.extend_from_slice(buf);
+
+    if offline_frame.v1.payload_transfer.payload_chunk.flags() & Flags::LAST_CHUNK.value() != 0 {
+        let transfer = transfers.remove(&header.id()).unwrap();
+        let res = match transfer.typ {
+            PayloadType::BYTES => TransferResult::Bytes(header.id(), transfer.data),
+            PayloadType::FILE => TransferResult::Frame(Frame::parse_from_bytes(&transfer.data).unwrap()),
+            _ => panic!("unknown payload type {:?}", transfer.typ),
+        };
+        //println!("transfer complete: {:?}", res);
+        return res
+    }
+
+    TransferResult::Nothing
 }
 
 impl From<PublicKey> for securemessage::GenericPublicKey {
@@ -403,8 +484,6 @@ async fn process(mut socket: TcpStream) -> ! {
         return format!("{:04}", hash.abs());
     }
 
-    dbg!(generate_pin_code(&authentication_string));
-
     // Connection Response
     let mut connection_response = ConnectionResponseFrame::new();
     connection_response.set_status(0);
@@ -433,8 +512,10 @@ async fn process(mut socket: TcpStream) -> ! {
     let mut client_seq_num = 0i32;
 
     // paired key encryption
-    let frame = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await;
-    dbg!(frame);
+    let Payload::Frame(frame) = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await else {
+        panic!("expected frame")
+    };
+    println!("< {:?}", frame);
 
     // send paired key encryption
     let mut signed_data = vec![0u8; 72];
@@ -457,8 +538,10 @@ async fn process(mut socket: TcpStream) -> ! {
 
     send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
 
-    let frame = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await;
-    dbg!(frame);
+    let Payload::Frame(frame) = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await else {
+        panic!("expected frame")
+    };
+    println!("< {:?}", frame);
 
     // paired key result
     let mut paired_key_result = PairedKeyResultFrame::new();
@@ -474,12 +557,74 @@ async fn process(mut socket: TcpStream) -> ! {
 
     send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
 
-    let frame = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await;
-    dbg!(frame);
+    let Payload::Frame(frame) = read_full_payload_transfer(&mut socket, &decrypt_key, &receive_hmac_key, &mut client_seq_num).await else {
+        panic!("expected frame")
+    };
+    println!("< {:?}", frame);
+    assert_eq!(frame.v1.type_(), wire_format::v1frame::FrameType::INTRODUCTION);
+    let files = &frame.v1.introduction.file_metadata;
+    for file in files {
+        let filename = file.name();
+        let typ = file.type_();
+        let size = file.size();
+        let mime_type = file.mime_type();
 
-    std::thread::sleep(std::time::Duration::from_secs(3));
+        println!("file: {} {:?} {} {}", filename, typ, size, mime_type);
+    }
+    // TODO: handle text transfers
 
-    todo!();
+    println!("Pin code: {}", generate_pin_code(&authentication_string));
+    print!("Accept (y/n)? ");
+    io::stdout().flush().unwrap();
+    let line = io::stdin().lines().next().unwrap().unwrap();
+
+    let mut response = wire_format::ConnectionResponseFrame::new();
+    if line == "y" {
+        println!("Accepting...");
+        response.set_status(wire_format::connection_response_frame::Status::ACCEPT);
+    } else {
+        println!("Rejecting...");
+        response.set_status(wire_format::connection_response_frame::Status::REJECT);
+    }
+
+    let mut v1frame = wire_format::V1Frame::new();
+    v1frame.set_type(wire_format::v1frame::FrameType::RESPONSE);
+    v1frame.connection_response = Some(response).into();
+
+    let mut frame = wire_format::Frame::new();
+    frame.set_version(frame::Version::V1);
+    frame.v1 = Some(v1frame).into();
+
+    send_frame(&mut socket, &frame, &encrypt_key, &send_hmac_key, &mut server_seq_num).await;
+
+    let mut transfers = HashMap::new();
+    loop {
+        match read_next_transfer(
+            &mut transfers,
+            &mut socket,
+            &decrypt_key,
+            &receive_hmac_key,
+            &mut client_seq_num,
+        ).await {
+            TransferResult::Nothing => {},
+            TransferResult::Keepalive => panic!("keepalive"),
+            TransferResult::Frame(frame) => {
+                dbg!(frame);
+            },
+            TransferResult::Bytes(id, data) => {
+                dbg!(id, files);
+                if data.len() > 100 {
+                    dbg!(&data[..100]);
+                } else {
+                    dbg!(&data);
+                }
+
+                let file = files.iter().find(|f| f.payload_id() == id).unwrap();
+                println!("received file: {} {:?}", file.name(), file.type_());
+                std::fs::File::create(file.name()).unwrap().write_all(&data).unwrap();
+            },
+        }
+    }
 }
 
 #[tokio::main]
