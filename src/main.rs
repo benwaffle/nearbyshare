@@ -1,6 +1,6 @@
 include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 
-use std::{io::{self, Write}, collections::HashMap};
+use std::{io::{self, Write}, collections::HashMap, error::Error};
 
 use aes::cipher::{BlockDecryptMut, block_padding::Pkcs7, KeyIvInit, BlockEncryptMut};
 use hkdf::Hkdf;
@@ -26,7 +26,7 @@ fn b64(bytes: &[u8]) -> String {
        .replace('+', "-")
 }
 
-fn broadcast_mdns(port: u16) {
+fn broadcast_mdns(port: u16) -> Result<(), Box<dyn Error>> {
     let service_type = "_FC9F5ED42C8A._tcp.local.";
 
     let mut name_bytes = [0x23, 0, 0, 0, 0, 0xfc, 0x9f, 0x5e, 0, 0];
@@ -35,29 +35,36 @@ fn broadcast_mdns(port: u16) {
     let instance_name = b64(&name_bytes);
     println!("dns-sd name: {}", instance_name);
 
-    // Create a daemon
     let mdns = ServiceDaemon::new().expect("Failed to create daemon");
 
-    // Create a service info.
-    let host_ipv4 = "192.168.1.165";
-    let host_name = "192.168.1.165.local.";
+    let host_name = hostname::get()?;
+    let host_name = host_name.to_string_lossy();
 
+    // 3 bits for version
+    // 1 bit for visiblity, 0 = visible
+    // 3 bits for device type, 0 = unknown, 1 = phone, 2 = tablet, 3 = laptop
+    // 1 bit reserved
     let flags: u8 = 0b00000110;
-    let n = [flags, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x3, b'b', b'e', b'n'];
+    let mut n = vec![flags, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf];
+    n.push(host_name.as_bytes().len() as u8);
+    n.extend_from_slice(host_name.as_bytes());
 
     let properties = [("n", b64(&n))];
 
     let my_service = ServiceInfo::new(
         service_type,
         &instance_name,
-        host_name,
-        host_ipv4,
+        &host_name,
+        (),
         port,
         &properties[..],
-    ).unwrap();
+    )?
+        .enable_addr_auto();
+    dbg!(&my_service);
 
     // Register with the daemon, which publishes the service.
-    mdns.register(my_service).expect("Failed to register our service");
+    mdns.register(my_service)?;
+    Ok(())
 }
 
 async fn start_server(listener: TcpListener) {
@@ -631,10 +638,10 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     println!("Listening on {}", listener.local_addr().unwrap());
-    broadcast_mdns(listener.local_addr().unwrap().port());
+    broadcast_mdns(listener.local_addr().unwrap().port())?;
 
     start_server(listener).await;
 
