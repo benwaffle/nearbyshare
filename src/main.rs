@@ -12,7 +12,7 @@ use p256::{ecdh::EphemeralSecret, EncodedPoint, elliptic_curve::{generic_array::
 use protobuf::{Message, SpecialFields, MessageField, Enum};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Sha512, Digest, Sha256};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, signal::unix::{signal, SignalKind}, sync::mpsc::{self, Sender}};
 
 use crate::{offline_wire_formats::{OfflineFrame, ConnectionResponseFrame, connection_response_frame::ResponseStatus, os_info::OsType, OsInfo, offline_frame, v1frame::FrameType, payload_transfer_frame::{PacketType, payload_header::PayloadType, PayloadHeader, PayloadChunk, payload_chunk::Flags}, PayloadTransferFrame}, ukey::{Ukey2ClientInit, Ukey2ServerInit, Ukey2Message, Ukey2HandshakeCipher, Ukey2Alert, ukey2message, Ukey2ClientFinished}, securemessage::{PublicKeyType, EcP256PublicKey, GenericPublicKey, SecureMessage, HeaderAndBody, SigScheme, Header, EncScheme}, securegcm::GcmMetadata, device_to_device_messages::DeviceToDeviceMessage, wire_format::{Frame, frame, PairedKeyEncryptionFrame, paired_key_result_frame, PairedKeyResultFrame}};
 
@@ -26,7 +26,7 @@ fn b64(bytes: &[u8]) -> String {
        .replace('+', "-")
 }
 
-fn broadcast_mdns(port: u16) -> Result<(), Box<dyn Error>> {
+fn broadcast_dns(port: u16, shutdown: Sender<()>) -> Result<(), Box<dyn Error>> {
     let service_type = "_FC9F5ED42C8A._tcp.local.";
 
     let mut name_bytes = [0x23, 0, 0, 0, 0, 0xfc, 0x9f, 0x5e, 0, 0];
@@ -62,8 +62,27 @@ fn broadcast_mdns(port: u16) -> Result<(), Box<dyn Error>> {
         .enable_addr_auto();
     dbg!(&my_service);
 
+    let full_name = my_service.get_fullname().to_string();
+
     // Register with the daemon, which publishes the service.
     mdns.register(my_service)?;
+
+    tokio::spawn(async move {
+        let die = async {
+            println!("unregistering");
+            mdns.unregister(&full_name).unwrap();
+            mdns.shutdown().unwrap();
+            shutdown.send(()).await.unwrap();
+        };
+
+        let mut int = signal(SignalKind::interrupt()).unwrap();
+        let mut term = signal(SignalKind::terminate()).unwrap();
+        tokio::select! {
+            _ = int.recv() => die.await,
+            _ = term.recv() => die.await,
+        }
+    });
+
     Ok(())
 }
 
@@ -639,23 +658,19 @@ async fn process(mut socket: TcpStream) -> io::Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let (shutdown_send, mut shutdown_recv) = mpsc::channel(1);
+
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     println!("Listening on {}", listener.local_addr().unwrap());
-    broadcast_mdns(listener.local_addr().unwrap().port())?;
+    broadcast_dns(listener.local_addr().unwrap().port(), shutdown_send.clone())?;
 
-    start_server(listener).await;
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_slice() {
-        let asdf = "abcdef";
-        let x = &asdf[asdf.len()-2..];
-        assert_eq!(x, "ef");
+    tokio::select! {
+        _ = start_server(listener) => {},
+        _ = shutdown_recv.recv() => {},
     }
+
+    drop(shutdown_send);
+
+    let _ = shutdown_recv.recv().await;
+    Ok(())
 }
